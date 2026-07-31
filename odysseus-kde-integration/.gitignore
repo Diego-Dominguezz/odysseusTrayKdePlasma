@@ -1,0 +1,22 @@
+# Bytecode
+**/*.py[cod]
+__pycache__/
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+ENV/
+
+# Distribution / build
+dist/
+build/
+*.egg-info/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

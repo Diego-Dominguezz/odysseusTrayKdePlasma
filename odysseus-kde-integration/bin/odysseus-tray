@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+"""
+Odysseus KDE Plasma Tray — user-level systemd tray service.
+
+Manages the lifecycle of the existing Odysseus Docker Compose stack
+and monitors the Ollama system service with desktop resource safety.
+
+Architecture:
+  - Runs as a user systemd service (odysseus-tray.service)
+  - Controls Ollama via sudo systemctl (system-level service)
+  - Controls Odysseus via docker compose (existing installation)
+  - Monitors system resources to prevent desktop hangs
+"""
+
+import os
+import sys
+import json
+import time
+import signal
+import subprocess
+import threading
+import urllib.request
+import urllib.error
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from PyQt6.QtWidgets import (
+        QApplication, QSystemTrayIcon, QMenu, QMessageBox, QDialog,
+        QVBoxLayout, QLabel, QHBoxLayout, QPushButton, QWidget
+    )
+    from PyQt6.QtGui import QIcon, QAction, QFont, QColor, QPalette
+    from PyQt6.QtCore import QTimer, Qt
+except ImportError:
+    print("Error: PyQt6 is required. Install with: pip install PyQt6", file=sys.stderr)
+    sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+ODYSSEUS_DIR = os.environ.get("ODYSSEUS_DIR", os.path.expanduser("~/Downloads/odysseus"))
+OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434")
+ICON_PATH = os.environ.get("ICON_PATH", os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/odysseus.svg"))
+SAFETY_MEM_THRESHOLD_MB = int(os.environ.get("SAFETY_MEM_THRESHOLD_MB", "5120"))  # 5 GiB
+POLL_INTERVAL_MS = 5000  # 5 seconds
+
+# State constants
+STATE_UNKNOWN = "unknown"
+STATE_STOPPED = "stopped"
+STATE_RUNNING = "running"
+STATE_STARTING = "starting"
+STATE_ERROR = "error"
+STATE_WARNING = "warning"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def run_cmd(cmd, timeout=30):
+    """Run a shell command and return (returncode, stdout, stderr)."""
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            shell=True, executable="/bin/bash"
+        )
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return -1, "", "timeout"
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def run_sudo(cmd, timeout=30):
+    """Run a sudo command (assumes passwordless sudo for systemctl)."""
+    return run_cmd(f"sudo {cmd}", timeout)
+
+
+def http_get(url, timeout=5):
+    """HTTP GET with timeout, returns (success, data_or_error)."""
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return True, resp.read().decode()
+    except Exception as e:
+        return False, str(e)
+
+
+def get_mem_available_mb():
+    """Get MemAvailable in MB from /proc/meminfo."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    kb = int(line.split()[1])
+                    return kb // 1024
+    except Exception:
+        pass
+    return 0
+
+
+def get_vram_info():
+    """Get (vram_total_mb, vram_used_mb) from sysfs."""
+    vram_total = 0
+    vram_used = 0
+    for card_path in Path("/sys/class/drm").glob("card*/device"):
+        try:
+            t = int((card_path / "mem_info_vram_total").read_text().strip())
+            u = int((card_path / "mem_info_vram_used").read_text().strip())
+            vram_total += t
+            vram_used += u
+        except Exception:
+            pass
+    return vram_total // (1024*1024), vram_used // (1024*1024)
+
+
+def get_memory_pressure():
+    """Get the current memory PSI avg10 value."""
+    try:
+        with open("/proc/pressure/memory") as f:
+            for line in f:
+                if line.startswith("some"):
+                    for part in line.split():
+                        if part.startswith("avg10="):
+                            return float(part.split("=")[1])
+    except Exception:
+        pass
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Status Check Functions
+# ---------------------------------------------------------------------------
+
+class StatusChecker:
+    """Polling-based status checks for all components."""
+
+    def __init__(self):
+        self._cache = {}
+        self._cache_time = 0
+
+    def _cached(self, key, ttl=2.0):
+        """Get cached value if within TTL."""
+        now = time.time()
+        if key in self._cache and now - self._cache_time < ttl:
+            return self._cache[key]
+        return None
+
+    def _set_cache(self, key, value):
+        self._cache[key] = value
+        self._cache_time = time.time()
+
+    def ollama_service(self):
+        """Check if Ollama systemd service is active."""
+        rc, out, _ = run_cmd("systemctl is-active ollama")
+        return rc == 0
+
+    def ollama_process_running(self):
+        """Check if any ollama process exists (including manual)."""
+        rc, _, _ = run_cmd("pgrep -x ollama >/dev/null 2>&1")
+        return rc == 0
+
+    def ollama_api(self):
+        """Check if Ollama API responds."""
+        ok, data = http_get(f"{OLLAMA_API}/api/tags")
+        if ok:
+            try:
+                models = json.loads(data).get("models", [])
+                return True, len(models)
+            except json.JSONDecodeError:
+                return True, 0
+        return False, 0
+
+    def ollama_model_loaded(self):
+        """Check if any model is currently loaded (has a runner process)."""
+        rc, out, _ = run_cmd("curl -s --max-time 3 http://127.0.0.1:11434/api/ps 2>/dev/null")
+        if rc == 0 and out:
+            try:
+                data = json.loads(out)
+                models = data.get("models", [])
+                return len(models) > 0, models
+            except json.JSONDecodeError:
+                pass
+        return False, []
+
+    def odysseus_running(self):
+        """Check if Odysseus container is running."""
+        rc, out, _ = run_cmd("docker ps --format '{{.Names}}' 2>/dev/null | grep -q odysseus")
+        return rc == 0
+
+    def odysseus_http(self):
+        """Check if Odysseus HTTP endpoint responds."""
+        ok, data = http_get("http://127.0.0.1:7000/login", timeout=5)
+        return ok
+
+    def docker_to_ollama(self):
+        """Check Docker-to-Ollama connectivity from inside the container."""
+        rc, out, _ = run_cmd(
+            "docker ps --format '{{.Names}}' 2>/dev/null | grep odysseus | head -1"
+        )
+        if rc != 0 or not out:
+            return False
+        container = out.strip()
+        rc, _, _ = run_cmd(
+            f"docker exec {container} curl -s --max-time 5 http://host.docker.internal:11434/api/tags >/dev/null 2>&1"
+        )
+        return rc == 0
+
+    def resource_safety(self):
+        """Check resource safety. Returns (status, message, mem_available_mb, vram_free_mb).
+        
+        Note: GPU VRAM is intentionally unbounded — model gets full GPU access.
+        Only system RAM is monitored for desktop fluency protection.
+        """
+        mem_avail = get_mem_available_mb()
+        vram_total, vram_used = get_vram_info()
+        vram_free = vram_total - vram_used
+        psi = get_memory_pressure()
+
+        warnings = []
+
+        if mem_avail < SAFETY_MEM_THRESHOLD_MB:
+            warnings.append(f"Low RAM: {mem_avail//1024}G available")
+        if vram_free < 256:  # Only warn at critically low VRAM
+            warnings.append(f"Critical VRAM: {vram_free} MiB free")
+        if psi > 10.0:
+            warnings.append(f"Memory pressure: avg10={psi:.1f}")
+
+        vram_display = f"{vram_free//1024}G" if vram_free > 1024 else f"{vram_free}M"
+        if not warnings:
+            return STATE_RUNNING, f"Mem: {mem_avail//1024}G free", mem_avail, vram_free
+        elif mem_avail < SAFETY_MEM_THRESHOLD_MB // 2:
+            return STATE_ERROR, f"CRITICAL: {'; '.join(warnings)}", mem_avail, vram_free
+        else:
+            return STATE_STOPPED, f"WARNING: {'; '.join(warnings)}", mem_avail, vram_free
+
+
+# ---------------------------------------------------------------------------
+# Tray Application
+# ---------------------------------------------------------------------------
+
+class OdysseusTray(QApplication):
+    """KDE Plasma system tray for Odysseus + Ollama management."""
+
+    def __init__(self, args):
+        super().__init__(args)
+        self.setApplicationName("Odysseus Tray")
+        self.setOrganizationName("Odysseus")
+        self.setQuitOnLastWindowClosed(False)
+
+        self.checker = StatusChecker()
+
+        # Build tray icon
+        self.icon_normal = self._load_icon()
+        self.tray = QSystemTrayIcon(self)
+        self.tray.setIcon(self.icon_normal)
+        self.tray.setToolTip("Odysseus — Starting...")
+
+        # Build menu
+        self.menu = QMenu()
+        self._build_menu()
+        self.tray.setContextMenu(self.menu)
+
+        # Show tray
+        if not self.tray.isVisible():
+            self.tray.show()
+
+        # Status polling timer
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._poll_status)
+        self.timer.start(POLL_INTERVAL_MS)
+
+        # Graceful shutdown
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+
+        # Initial poll
+        QTimer.singleShot(500, self._poll_status)
+
+    def _load_icon(self):
+        """Load the tray icon from known paths."""
+        paths = [
+            ICON_PATH,
+            os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps/odysseus.svg"),
+            "/usr/share/icons/hicolor/scalable/apps/odysseus.svg",
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                icon = QIcon(p)
+                if not icon.isNull():
+                    return icon
+        # Fallback: create a simple pixmap
+        from PyQt6.QtGui import QPixmap, QPainter, QBrush, QColor
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setBrush(QBrush(QColor("#e94560")))
+        painter.drawEllipse(4, 4, 56, 56)
+        painter.end()
+        return QIcon(pixmap)
+
+    def _build_menu(self):
+        """Build the tray context menu."""
+        self.menu.clear()
+
+        # Status display
+        self.status_label = self.menu.addAction("Checking...")
+        self.status_label.setEnabled(False)
+        self.menu.addSeparator()
+
+        # Actions
+        self.action_open = QAction("🌐 Open Odysseus", self)
+        self.action_open.triggered.connect(self._open_odysseus)
+        self.menu.addAction(self.action_open)
+
+        self.action_start = QAction("▶ Start Odysseus", self)
+        self.action_start.triggered.connect(self._start_odysseus)
+        self.menu.addAction(self.action_start)
+
+        self.action_stop = QAction("⏹ Stop Odysseus", self)
+        self.action_stop.triggered.connect(self._stop_odysseus)
+        self.menu.addAction(self.action_stop)
+
+        self.action_restart = QAction("🔄 Restart Odysseus", self)
+        self.action_restart.triggered.connect(self._restart_odysseus)
+        self.menu.addAction(self.action_restart)
+
+        self.menu.addSeparator()
+
+        self.action_logs = QAction("📋 View Logs", self)
+        self.action_logs.triggered.connect(self._view_logs)
+        self.menu.addAction(self.action_logs)
+
+        self.action_copy_password = QAction("🔑 Copy Admin Password", self)
+        self.action_copy_password.triggered.connect(self._copy_admin_password)
+        self.menu.addAction(self.action_copy_password)
+
+        self.action_health = QAction("🏥 Health Check", self)
+        self.action_health.triggered.connect(self._run_healthcheck)
+        self.menu.addAction(self.action_health)
+
+        self.menu.addSeparator()
+
+        # Ollama controls
+        self.action_ollama_status = QAction("🤖 Ollama: Checking...", self)
+        self.action_ollama_status.setEnabled(False)
+        self.menu.addAction(self.action_ollama_status)
+
+        self.action_ollama_start = QAction("▶ Start Ollama", self)
+        self.action_ollama_start.triggered.connect(self._start_ollama)
+        self.menu.addAction(self.action_ollama_start)
+
+        self.action_ollama_restart = QAction("🔄 Restart Ollama", self)
+        self.action_ollama_restart.triggered.connect(self._restart_ollama)
+        self.menu.addAction(self.action_ollama_restart)
+
+        self.menu.addSeparator()
+
+        self.action_quit = QAction("🚪 Quit Tray", self)
+        self.action_quit.triggered.connect(self._quit_tray)
+        self.menu.addAction(self.action_quit)
+
+    def _update_status_display(self, ollama_state, ollama_api_ok, model_count, odys_state, resource_state, resource_msg):
+        """Update tray tooltip and status label."""
+        lines = []
+        if ollama_state == STATE_RUNNING:
+            lines.append(f"Ollama: Running")
+            if ollama_api_ok:
+                lines.append(f"Models: {model_count}")
+        elif ollama_state == STATE_ERROR:
+            lines.append("Ollama: Stopped")
+        else:
+            lines.append("Ollama: Checking...")
+
+        if odys_state == STATE_RUNNING:
+            lines.append("Odysseus: Running")
+        elif odys_state == STATE_STARTING:
+            lines.append("Odysseus: Starting...")
+        else:
+            lines.append("Odysseus: Stopped")
+
+        lines.append(f"Mem: {resource_msg}")
+
+        tooltip = "\n".join(lines)
+        self.tray.setToolTip(tooltip)
+
+        # Set the first status label
+        status_text = f"Ollama: {'Running' if ollama_state == STATE_RUNNING else 'Stopped'}"
+        status_text += f"  |  Odysseus: {'Running' if odys_state == STATE_RUNNING else 'Stopped'}"
+        self.status_label.setText(status_text)
+
+        # Update Ollama status text
+        if ollama_state == STATE_RUNNING and ollama_api_ok:
+            self.action_ollama_status.setText(f"🤖 Ollama: Running ({model_count} models)")
+        elif ollama_state == STATE_ERROR:
+            self.action_ollama_status.setText("🤖 Ollama: Stopped")
+        else:
+            self.action_ollama_status.setText(f"🤖 Ollama: Checking...")
+
+    def _poll_status(self):
+        """Periodic status polling."""
+
+        # Check Ollama
+        ollama_svc = self.checker.ollama_service()
+        ollama_proc = self.checker.ollama_process_running()
+        ollama_state = STATE_RUNNING if (ollama_svc or ollama_proc) else STATE_ERROR
+
+        ollama_api_ok = False
+        model_count = 0
+        if ollama_state == STATE_RUNNING:
+            ollama_api_ok, model_count = self.checker.ollama_api()
+
+        # Check Odysseus
+        odys_running = self.checker.odysseus_running()
+        odys_http = self.checker.odysseus_http() if odys_running else False
+        odys_state = STATE_RUNNING if odys_http else (STATE_STARTING if odys_running else STATE_STOPPED)
+
+        # Check resources
+        resource_state, resource_msg, mem_mb, vram_free_mb = self.checker.resource_safety()
+
+        # Auto-detect admin password on first run after Odysseus becomes available
+        # Only attempt once per session (self._password_checked flag)
+        if odys_state == STATE_RUNNING and not getattr(self, '_password_checked', False):
+            self._password_checked = True
+            self._auto_password_notify()
+
+        # Update display
+        self._update_status_display(
+            ollama_state, ollama_api_ok, model_count, odys_state,
+            resource_state, resource_msg
+        )
+
+        # Disable/enable actions based on state
+        self.action_start.setEnabled(odys_state != STATE_RUNNING)
+        self.action_stop.setEnabled(odys_state == STATE_RUNNING)
+        self.action_restart.setEnabled(odys_state == STATE_RUNNING)
+        self.action_ollama_start.setEnabled(ollama_state != STATE_RUNNING)
+
+    def _open_odysseus(self):
+        """Open Odysseus in the default browser."""
+        subprocess.Popen(["xdg-open", "http://127.0.0.1:7000"])
+
+    def _start_odysseus(self):
+        """Start the Odysseus Docker Compose stack."""
+        self.status_label.setText("Starting Odysseus...")
+        threading.Thread(target=self._do_start_odysseus, daemon=True).start()
+
+    def _do_start_odysseus(self):
+        subprocess.run(
+            ["bash", "-c", f"cd {ODYSSEUS_DIR} && docker compose up -d"],
+            capture_output=True, timeout=120
+        )
+        # Wait for HTTP readiness
+        for _ in range(30):
+            ok, _ = http_get("http://127.0.0.1:7000/login", timeout=2)
+            if ok:
+                break
+            time.sleep(2)
+
+    def _stop_odysseus(self):
+        """Stop the Odysseus Docker Compose stack."""
+        self.status_label.setText("Stopping Odysseus...")
+        threading.Thread(target=self._do_stop_odysseus, daemon=True).start()
+
+    def _do_stop_odysseus(self):
+        subprocess.run(
+            ["bash", "-c", f"cd {ODYSSEUS_DIR} && docker compose down"],
+            capture_output=True, timeout=120
+        )
+
+    def _restart_odysseus(self):
+        """Restart the Odysseus Docker Compose stack."""
+        self.status_label.setText("Restarting Odysseus...")
+        threading.Thread(target=self._do_restart_odysseus, daemon=True).start()
+
+    def _do_restart_odysseus(self):
+        subprocess.run(
+            ["bash", "-c", f"cd {ODYSSEUS_DIR} && docker compose down && sleep 3 && docker compose up -d"],
+            capture_output=True, timeout=180
+        )
+        for _ in range(30):
+            ok, _ = http_get("http://127.0.0.1:7000/login", timeout=2)
+            if ok:
+                break
+            time.sleep(2)
+
+    def _view_logs(self):
+        """View Odysseus logs in a terminal."""
+        subprocess.Popen([
+            "konsole", "--hold", "-e", "bash", "-c",
+            f"cd {ODYSSEUS_DIR} && docker compose logs --tail=100 -f"
+        ])
+
+    def _copy_admin_password(self):
+        """Extract the admin password from Docker logs and copy to clipboard."""
+        threading.Thread(target=self._do_copy_password, daemon=True).start()
+
+    def _do_copy_password(self):
+        try:
+            rc, out, _ = run_cmd(
+                f"cd {ODYSSEUS_DIR} && docker compose logs odysseus 2>/dev/null | "
+                "grep -F 'Temporary password:' | tail -n 1 | sed 's/.*Temporary password: //' | tr -d '\r\n'"
+            )
+            if rc != 0 or not out:
+                self.tray.showMessage(
+                    "Odysseus", "No temporary password found in Docker logs.",
+                    QSystemTrayIcon.MessageIcon.Warning, 5000
+                )
+                return
+
+            password = out.strip()
+            # Try to copy using available clipboard tools
+            clipboard_cmd = ""
+            if os.path.exists("/usr/bin/wl-copy"):
+                clipboard_cmd = f"printf '%s' '{password}' | /usr/bin/wl-copy"
+            elif os.path.exists("/usr/bin/xclip"):
+                clipboard_cmd = f"printf '%s' '{password}' | /usr/bin/xclip -selection clipboard"
+            elif os.path.exists("/usr/bin/xsel"):
+                clipboard_cmd = f"printf '%s' '{password}' | /usr/bin/xsel --clipboard --input"
+
+            if clipboard_cmd:
+                run_cmd(clipboard_cmd)
+                self.tray.showMessage(
+                    "Odysseus", "Admin password copied to clipboard.",
+                    QSystemTrayIcon.MessageIcon.Information, 5000
+                )
+            else:
+                self.tray.showMessage(
+                    "Odysseus", f"Admin password: {password}\nInstall wl-clipboard for clipboard support.",
+                    QSystemTrayIcon.MessageIcon.Information, 10000
+                )
+        except Exception as e:
+            self.tray.showMessage(
+                "Odysseus", f"Error: {e}",
+                QSystemTrayIcon.MessageIcon.Critical, 5000
+            )
+
+    def _run_healthcheck(self):
+        """Run the health check script and show results."""
+        subprocess.Popen([
+            "konsole", "--hold", "-e", "bash", "-c",
+            f"{os.path.expanduser('~/.local/bin/odysseus-healthcheck')}; "
+            "echo; echo 'Press Enter to close...'; read"
+        ])
+
+    def _start_ollama(self):
+        """Start Ollama via systemd."""
+        self.status_label.setText("Starting Ollama...")
+        threading.Thread(target=self._do_start_ollama, daemon=True).start()
+
+    def _do_start_ollama(self):
+        run_sudo("systemctl start ollama")
+        for _ in range(30):
+            ok, _ = http_get(f"{OLLAMA_API}/api/tags", timeout=2)
+            if ok:
+                break
+            time.sleep(2)
+
+    def _restart_ollama(self):
+        """Restart Ollama via systemd."""
+        run_sudo("systemctl restart ollama")
+
+    def _handle_signal(self, signum, frame):
+        """Handle shutdown signals gracefully."""
+        self.quit()
+
+    def _auto_password_notify(self):
+        """On first detection of Odysseus being up, check for a Temporary password
+        in the Docker logs. If found, notify and copy to clipboard."""
+        try:
+            rc, out, _ = run_cmd(
+                f"cd {ODYSSEUS_DIR} && docker compose logs odysseus 2>/dev/null | "
+                "grep -F 'Temporary password:' | tail -n 1 | sed 's/.*Temporary password: //' | tr -d '\r\n'"
+            )
+            if rc == 0 and out:
+                password = out.strip()
+                # Try clipboard
+                clipboard_cmd = ""
+                if os.path.exists("/usr/bin/wl-copy"):
+                    clipboard_cmd = f"printf '%s' '{password}' | /usr/bin/wl-copy"
+                elif os.path.exists("/usr/bin/xclip"):
+                    clipboard_cmd = f"printf '%s' '{password}' | /usr/bin/xclip -selection clipboard"
+                elif os.path.exists("/usr/bin/xsel"):
+                    clipboard_cmd = f"printf '%s' '{password}' | /usr/bin/xsel --clipboard --input"
+
+                if clipboard_cmd:
+                    run_cmd(clipboard_cmd)
+                    self.tray.showMessage(
+                        "Odysseus - Admin Password",
+                        f"Temporary password copied to clipboard.\nLogin at http://127.0.0.1:7000",
+                        QSystemTrayIcon.MessageIcon.Information, 8000
+                    )
+                else:
+                    self.tray.showMessage(
+                        "Odysseus - Admin Password",
+                        f"Temporary password: {password}\nLogin at http://127.0.0.1:7000",
+                        QSystemTrayIcon.MessageIcon.Information, 12000
+                    )
+        except Exception:
+            pass  # Silent — this is a best-effort notification
+
+    def _quit_tray(self):
+        """Quit only the tray application. Does NOT stop Odysseus or Ollama."""
+        self.quit()
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    # Verify icon exists, try to create it from the integration repo
+    icon_dir = Path(os.path.expanduser("~/.local/share/icons/hicolor/scalable/apps"))
+    icon_path = icon_dir / "odysseus.svg"
+    if not icon_path.exists():
+        # Check multiple possible source locations
+        for src in [
+            Path(os.path.expanduser("~/.local/share/odysseus-kde-integration/icons/odysseus.svg")),
+            Path("/usr/local/share/odysseus-kde-integration/icons/odysseus.svg"),
+            Path(os.path.dirname(os.path.abspath(__file__))) / "../icons/odysseus.svg",
+        ]:
+            if src.exists():
+                icon_dir.mkdir(parents=True, exist_ok=True)
+                import shutil
+                shutil.copy2(str(src), str(icon_path))
+                break
+
+    app = OdysseusTray(sys.argv)
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()

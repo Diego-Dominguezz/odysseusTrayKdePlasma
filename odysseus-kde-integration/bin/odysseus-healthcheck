@@ -1,0 +1,173 @@
+#!/bin/bash
+# Odysseus KDE Integration — Health Check
+# Performs comprehensive system health verification including resource safety checks.
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+PASS="${GREEN}OK${NC}"; FAIL="${RED}FAIL${NC}"; WARN="${YELLOW}WARN${NC}"; INFO="${CYAN}INFO${NC}"
+
+ODYSSEUS_DIR="${ODYSSEUS_DIR:-$HOME/Downloads/odysseus}"
+OLLAMA_API="${OLLAMA_API:-http://127.0.0.1:11434}"
+SAFETY_MEM_THRESHOLD="${SAFETY_MEM_THRESHOLD:-5}"
+SAFETY_VRAM_THRESHOLD="${SAFETY_VRAM_THRESHOLD:-1}"
+
+total_checks=0; passed_checks=0; failed_checks=0; warn_checks=0
+
+check() {
+    local name="$1" status="$2" detail="$3"
+    total_checks=$((total_checks + 1))
+    case "$status" in
+        pass) passed_checks=$((passed_checks + 1)); echo -e "  ${PASS}  ${name}: ${detail}" ;;
+        fail) failed_checks=$((failed_checks + 1)); echo -e "  ${FAIL}  ${name}: ${detail}" ;;
+        warn) warn_checks=$((warn_checks + 1));    echo -e "  ${WARN}  ${name}: ${detail}" ;;
+        info)                                     echo -e "  ${INFO}  ${name}: ${detail}" ;;
+    esac
+}
+
+echo ""; echo "============================================"; echo "  Odysseus KDE Integration - Health Check"; echo "============================================"; echo ""
+
+# --- Ollama Service ---
+echo " --- Ollama ---"
+if systemctl is-active --quiet ollama 2>/dev/null; then
+    check "Ollama service" "pass" "systemd service is active"
+else
+    if pgrep -x ollama >/dev/null 2>&1; then
+        check "Ollama service" "warn" "systemd inactive but ollama process running (PID $(pgrep -x ollama))"
+    else
+        check "Ollama service" "fail" "systemd inactive and no ollama process found"
+    fi
+fi
+
+# --- Ollama API ---
+OLLAMA_TAGS=""
+if OLLAMA_TAGS=$(curl -s --max-time 5 "${OLLAMA_API}/api/tags" 2>/dev/null); then
+    MODEL_COUNT=$(echo "$OLLAMA_TAGS" | python3 -c "import sys,json; print(len(json.load(sys.stdin).get('models',[])))" 2>/dev/null || echo "0")
+    if [ "${MODEL_COUNT}" -gt 0 ] 2>/dev/null; then
+        check "Ollama API" "pass" "responding (${MODEL_COUNT} models)"
+    else
+        check "Ollama API" "warn" "responding but no models found"
+    fi
+else
+    check "Ollama API" "fail" "cannot reach ${OLLAMA_API}/api/tags"
+fi
+
+# --- Resource Safety: Memory ---
+echo ""; echo " --- Resource Safety ---"
+MEM_AVAILABLE_KB=$(awk '/MemAvailable/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_AVAILABLE_GB=$(awk "BEGIN {printf \"%.1f\", ${MEM_AVAILABLE_KB} / 1048576}")
+MEM_TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+MEM_TOTAL_GB=$(awk "BEGIN {printf \"%.1f\", ${MEM_TOTAL_KB} / 1048576}")
+
+check "Available RAM" "info" "${MEM_AVAILABLE_GB} GiB / ${MEM_TOTAL_GB} GiB total"
+
+if awk "BEGIN {exit !(${MEM_AVAILABLE_KB} > ${SAFETY_MEM_THRESHOLD} * 1048576)}" 2>/dev/null; then
+    check "Memory safety" "pass" "${MEM_AVAILABLE_GB} GiB available (threshold: ${SAFETY_MEM_THRESHOLD} GiB)"
+else
+    check "Memory safety" "fail" "Only ${MEM_AVAILABLE_GB} GiB available (threshold: ${SAFETY_MEM_THRESHOLD} GiB)"
+fi
+
+# --- Memory pressure ---
+[ -f /proc/pressure/memory ] && MEM_PSI=$(awk '/some/{printf "avg10=%.2f",$2}' /proc/pressure/memory 2>/dev/null) && check "Memory PSI" "info" "${MEM_PSI}"
+
+# --- Swap / ZRAM ---
+SWAP_USED_GB=$(awk '$1 ~ /^\/dev\/(dm|zram|nvme|sd|vd)/{printf "%.1f", $3/1048576; exit}' /proc/swaps 2>/dev/null || echo "0.0")
+check "Swap used" "info" "${SWAP_USED_GB} GiB"
+
+# --- Ollama Process Memory ---
+OLLAMA_TOTAL_RSS_KB=0; OLLAMA_PIDS=""
+while IFS= read -r line; do
+    pid=$(echo "$line" | awk '{print $1}')
+    rss=$(echo "$line" | awk '{print $2}')
+    OLLAMA_TOTAL_RSS_KB=$((OLLAMA_TOTAL_RSS_KB + rss))
+    OLLAMA_PIDS="$OLLAMA_PIDS $pid"
+done < <(ps -eo pid,rss,args --sort=-rss 2>/dev/null | grep -E '[o]llama|[l]lama' | grep -v grep || true)
+[ -n "$OLLAMA_PIDS" ] && OLLAMA_RSS_GB=$(awk "BEGIN {printf \"%.1f\", ${OLLAMA_TOTAL_RSS_KB} / 1048576}") && check "Ollama RSS" "info" "${OLLAMA_RSS_GB} GiB total (PIDs:${OLLAMA_PIDS})"
+
+# --- GPU / VRAM ---
+echo ""; echo " --- GPU ---"
+VRAM_TOTAL_BYTES=0; VRAM_USED_BYTES=0
+for card in /sys/class/drm/card*/device/mem_info_vram_total; do
+    [ -f "$card" ] || continue
+    t=$(cat "$card" 2>/dev/null) || t=0
+    VRAM_TOTAL_BYTES=$((VRAM_TOTAL_BYTES + t))
+done
+for card in /sys/class/drm/card*/device/mem_info_vram_used; do
+    [ -f "$card" ] || continue
+    u=$(cat "$card" 2>/dev/null) || u=0
+    VRAM_USED_BYTES=$((VRAM_USED_BYTES + u))
+done
+
+if [ "$VRAM_TOTAL_BYTES" -gt 0 ]; then
+    VRAM_TOTAL_GB=$(awk "BEGIN {printf \"%.1f\", ${VRAM_TOTAL_BYTES} / 1073741824}")
+    VRAM_USED_GB=$(awk "BEGIN {printf \"%.1f\", ${VRAM_USED_BYTES} / 1073741824}")
+    VRAM_FREE_GB=$(awk "BEGIN {printf \"%.1f\", (${VRAM_TOTAL_BYTES} - ${VRAM_USED_BYTES}) / 1073741824}")
+    check "VRAM" "info" "${VRAM_USED_GB} GiB / ${VRAM_TOTAL_GB} GiB used (${VRAM_FREE_GB} GiB free) — full GPU access"
+    if awk "BEGIN {exit !(${VRAM_FREE_GB} < 0.5)}" 2>/dev/null; then
+        check "VRAM safety" "warn" "Critically low VRAM (${VRAM_FREE_GB} GiB free) — model may fail to load"
+    fi
+fi
+
+GPU_BUSY=$(cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | head -1 || echo "?")
+check "GPU utilization" "info" "${GPU_BUSY}%"
+
+# --- DCN32 REG_WAIT timeout check ---
+REG_WAIT_COUNT=$(journalctl -k -b --no-pager 2>/dev/null | grep -c "REG_WAIT timeout.*dcn32_program_compbuf_size" 2>/dev/null || echo 0)
+if [ "$REG_WAIT_COUNT" -gt 0 ]; then
+    check "Display stutters" "warn" "${REG_WAIT_COUNT} DCN32 REG_WAIT timeouts this boot"
+else
+    check "Display stutters" "pass" "No DCN32 REG_WAIT timeouts detected"
+fi
+
+# --- Docker ---
+echo ""; echo " --- Docker ---"
+if docker info >/dev/null 2>&1; then check "Docker daemon" "pass" "running"; else check "Docker daemon" "fail" "not running"; fi
+if command -v docker-compose >/dev/null 2>&1 || docker compose version >/dev/null 2>&1; then check "Docker Compose" "pass" "available"; else check "Docker Compose" "fail" "not found"; fi
+
+# --- Odysseus Directory ---
+if [ -d "$ODYSSEUS_DIR" ]; then
+    check "Odysseus directory" "pass" "${ODYSSEUS_DIR}"
+    [ -f "${ODYSSEUS_DIR}/docker-compose.yml" ] && check "docker-compose.yml" "pass" "found" || check "docker-compose.yml" "fail" "not found"
+else
+    check "Odysseus directory" "fail" "not found at ${ODYSSEUS_DIR}"
+fi
+
+# --- Odysseus Container ---
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "odysseus"; then
+    ODY_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep odysseus | head -1)
+    check "Odysseus container" "pass" "${ODY_CONTAINER} is running"
+else
+    check "Odysseus container" "fail" "no odysseus container running"
+fi
+
+# --- Docker to Ollama ---
+if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "odysseus"; then
+    ODY_CONTAINER=$(docker ps --format '{{.Names}}' 2>/dev/null | grep odysseus | head -1)
+    if docker exec "$ODY_CONTAINER" curl -s --max-time 5 "http://host.docker.internal:11434/api/tags" >/dev/null 2>&1; then
+        check "Docker to Ollama" "pass" "Odysseus container can reach Ollama"
+    else
+        check "Docker to Ollama" "fail" "Odysseus container cannot reach Ollama"
+    fi
+else
+    check "Docker to Ollama" "warn" "cannot test - Odysseus container not running"
+fi
+
+# --- Odysseus HTTP ---
+HTTP_CODE=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" "http://127.0.0.1:7000/login" 2>/dev/null || echo "no response")
+if echo "$HTTP_CODE" | grep -qE '200|302|401'; then
+    check "Odysseus HTTP" "pass" "http://127.0.0.1:7000 is responding (${HTTP_CODE})"
+else
+    check "Odysseus HTTP" "fail" "http://127.0.0.1:7000 returned ${HTTP_CODE}"
+fi
+
+# --- KDE Tray ---
+echo ""; echo " --- KDE Tray ---"
+if systemctl --user is-active --quiet odysseus-tray.service 2>/dev/null; then check "Tray service" "pass" "user systemd active"; else check "Tray service" "fail" "user systemd not active"; fi
+
+# --- Summary ---
+echo ""; echo "============================================"; echo "  Summary"; echo "============================================"; echo ""
+echo "  Total checks: ${total_checks}"
+echo -e "  Passed:       ${GREEN}${passed_checks}${NC}"
+echo -e "  Failed:       ${RED}${failed_checks}${NC}"
+echo -e "  Warnings:     ${YELLOW}${warn_checks}${NC}"
+echo ""
+[ "${failed_checks}" -gt 0 ] && exit 1 || [ "${warn_checks}" -gt 0 ] && exit 2 || exit 0

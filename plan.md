@@ -690,3 +690,80 @@ The final output should provide:
 10. Exact commands to push the repository to GitHub.
 
 Do not simplify the architecture by replacing the user-level tray service with a system-wide Odysseus service. The separation between the existing Odysseus Docker installation, the system-level Ollama service, and the user-level KDE tray controller is a hard requirement.
+
+# OLLAMA RESOURCE SAFETY LAYER (PHASE 0.6 — HARD REQUIREMENT)
+
+The desktop must remain responsive even if Ollama or the model experiences abnormal memory pressure.
+
+KDE Plasma / Wayland MUST remain responsive — mouse/input, compositor, desktop apps, terminal.
+
+Ollama must NEVER cause:
+- KDE Plasma hangs
+- Wayland compositor hangs
+- mouse/input freezes
+- severe desktop stuttering
+- system-wide memory thrashing
+- uncontrolled swap storms
+- OOM conditions affecting Plasma
+- starvation of essential desktop processes
+
+Priority: STABLE DESKTOP FIRST, LOCAL LLM SECOND.
+
+## Diagnostic Evidence (Phase 0.5)
+
+Measured on the target system (32 GiB RAM, 16 GiB VRAM RX 7800 XT):
+
+- gemma4:26b (Q4_K_M, 18 GB) uses ~9.2 GiB system RAM peak + ~8.4 GiB VRAM
+- No OOM events, no model crashes, no runner termination
+- Memory PSI avg10 = 0.00 at idle
+- The main ollama supervisor process itself is small (~32 MB RSS); the runner carries model memory
+- 5-minute keep-alive caused model reload latency that appeared as response cutoffs
+- System RAM bounding (24G/27G) is the primary mechanism to keep the desktop fluent
+- Full GPU/VRAM access is granted for maximum model inference performance
+
+## Safety Configuration
+
+Installed to `/etc/systemd/system/ollama.service.d/override.conf`:
+
+```
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+Environment="OLLAMA_KEEP_ALIVE=30m"         # Reduce reload frequency
+Environment="OLLAMA_NUM_PARALLEL=1"         # Limit peak memory
+Environment="OLLAMA_MAX_LOADED_MODELS=1"    # One model at a time
+Environment="OLLAMA_FLASH_ATTENTION=1"      # Slightly lower VRAM usage
+MemoryHigh=24G                              # Soft RAM limit (protects desktop)
+MemoryMax=27G                               # Hard RAM limit (prevents OOM)
+OOMScoreAdjust=500                          # Ollama sacrificed first
+```
+
+Note: No GPU VRAM limit is set. The model gets full GPU/VRAM access.
+Only system RAM is bounded to keep the desktop fluent.
+
+## Resource Zones
+
+| Zone | MemAvailable | Action |
+|------|-------------|--------|
+| Normal | > 8 GiB | Normal operation |
+| Warning | 5-8 GiB | Warn user, monitor memory growth |
+| Critical | 3-5 GiB | Recommend unloading / reducing model workload |
+| Emergency | < 3 GiB | Model may be unloaded under OOM pressure |
+
+## Health Check Resource Reporting
+
+The healthcheck reports:
+- MemAvailable (GiB)
+- VRAM used/free (GiB)
+- GPU utilization (%)
+- Memory PSI (avg10)
+- Swap/zram usage
+- Ollama total RSS
+- DCN32 REG_WAIT timeout count (display stutter indicator)
+
+## Dual-Ollama Prevention (Critical)
+
+The Phase 0.5 diagnostic found the systemd ollama.service restarting 1,413+ times with
+`bind: address already in use` because a manually-started `ollama serve` held port 11434.
+The installer must detect and stop manual instances before starting the systemd service.
+
+---

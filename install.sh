@@ -1,32 +1,17 @@
 #!/usr/bin/env bash
+# Odysseus Local Stack — Installer
+# Delegates to the KDE integration installer in odysseus-kde-integration/
 set -Eeuo pipefail
+
 REPO_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-ODYSSEUS_DIR="${ODYSSEUS_DIR:-$HOME/Downloads/odysseus}"
+INTEGRATION_DIR="$REPO_DIR/odysseus-kde-integration"
 
-log(){ printf '\n[odysseus-stack] %s\n' "$*"; }
-die(){ printf '\n[odysseus-stack] ERROR: %s\n' "$*" >&2; exit 1; }
-
-[[ -d "$ODYSSEUS_DIR" ]] || die "Odysseus directory not found: $ODYSSEUS_DIR"
-[[ -f "$ODYSSEUS_DIR/docker-compose.yml" ]] || die "docker-compose.yml not found in $ODYSSEUS_DIR"
-command -v docker >/dev/null || die "Docker is not installed"
-command -v ollama >/dev/null || die "Ollama is not installed"
-command -v python3 >/dev/null || die "Python 3 is not installed"
-
-log "Configuring Docker group"
-if ! id -nG "$USER" | tr ' ' '\n' | grep -qx docker; then
-  sudo usermod -aG docker "$USER"
-  log "Docker group added. Log out and back in once if this is the first time."
+if [ -f "$INTEGRATION_DIR/install.sh" ]; then
+    exec "$INTEGRATION_DIR/install.sh"
+else
+    echo "ERROR: Integration installer not found at $INTEGRATION_DIR/install.sh" >&2
+    exit 1
 fi
-
-log "Configuring Ollama for container access"
-sudo mkdir -p /etc/systemd/system/ollama.service.d
-sudo tee /etc/systemd/system/ollama.service.d/override.conf >/dev/null <<'EOT'
-[Service]
-Environment="OLLAMA_HOST=0.0.0.0:11434"
-EOT
-sudo systemctl daemon-reload
-sudo systemctl enable ollama
-sudo systemctl restart ollama
 
 log "Waiting for Ollama"
 for i in {1..60}; do

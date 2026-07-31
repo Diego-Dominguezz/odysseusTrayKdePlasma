@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Odysseus Tray
+Comment=KDE Plasma system tray for Odysseus + Ollama
+Exec=odysseus-tray
+Icon=odysseus
+Type=Application
+Categories=Utility;
+Terminal=false
+X-KDE-autostart-after=panel

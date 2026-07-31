@@ -1,0 +1,80 @@
+#!/bin/bash
+# Odysseus KDE Integration — Docker Compose Launcher
+# Controls the existing Odysseus Docker Compose stack.
+set -euo pipefail
+
+ODYSSEUS_DIR="${ODYSSEUS_DIR:-$HOME/Downloads/odysseus}"
+COMPOSE_CMD=""
+
+# Detect Docker Compose command
+if command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_CMD="docker-compose"
+elif docker compose version >/dev/null 2>&1; then
+    COMPOSE_CMD="docker compose"
+else
+    echo "Error: Docker Compose not found" >&2
+    exit 1
+fi
+
+cd "$ODYSSEUS_DIR"
+
+case "${1:-status}" in
+    start)
+        echo "Starting Odysseus Docker Compose stack..."
+        $COMPOSE_CMD up -d
+        echo "Done."
+        ;;
+    stop)
+        echo "Stopping Odysseus Docker Compose stack..."
+        $COMPOSE_CMD down
+        echo "Done."
+        ;;
+    restart)
+        echo "Restarting Odysseus Docker Compose stack..."
+        $COMPOSE_CMD down
+        sleep 3
+        $COMPOSE_CMD up -d
+        echo "Done."
+        ;;
+    status)
+        $COMPOSE_CMD ps --format 'table {{.Name}}\t{{.Status}}' 2>/dev/null || $COMPOSE_CMD ps
+        ;;
+    logs)
+        $COMPOSE_CMD logs --tail=50 -f 2>/dev/null || $COMPOSE_CMD logs --tail=50
+        ;;
+    copy-password)
+        # Extract the temporary admin password from Docker logs and copy to clipboard
+        password="$(
+            $COMPOSE_CMD logs odysseus 2>/dev/null |
+                grep -F "Temporary password:" |
+                tail -n 1 |
+                sed 's/.*Temporary password: //' |
+                tr -d '\r\n'
+        )"
+        if [ -z "$password" ]; then
+            echo "No temporary password found in Docker logs."
+            echo "The admin password may have been set via ODYSSEUS_ADMIN_PASSWORD env var."
+            exit 1
+        fi
+        # Copy to clipboard — try wl-copy (Wayland), then xclip, then xsel
+        if command -v wl-copy >/dev/null 2>&1; then
+            printf '%s' "$password" | wl-copy
+        elif command -v xclip >/dev/null 2>&1; then
+            printf '%s' "$password" | xclip -selection clipboard
+        elif command -v xsel >/dev/null 2>&1; then
+            printf '%s' "$password" | xsel --clipboard --input
+        else
+            echo "No clipboard tool found. Install wl-clipboard (Wayland) or xclip/xsel (X11)."
+            echo "Password: $password"
+            exit 1
+        fi
+        echo "Admin password copied to clipboard."
+        if command -v notify-send >/dev/null 2>&1; then
+            notify-send "Odysseus" "Admin password copied to clipboard."
+        fi
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart|status|logs|copy-password}"
+        exit 1
+        ;;
+esac

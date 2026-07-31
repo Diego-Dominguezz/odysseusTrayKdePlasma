@@ -1,0 +1,17 @@
+[Unit]
+Description=Odysseus KDE Plasma Tray
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/odysseus-tray
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+Environment=QT_QPA_PLATFORM=wayland
+Environment=QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+
+[Install]
+WantedBy=default.target

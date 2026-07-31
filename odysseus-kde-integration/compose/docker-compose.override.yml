@@ -1,0 +1,15 @@
+version: '3.8'
+
+# Odysseus KDE Integration — Docker Compose Override
+#
+# Installed by install.sh to: ~/Downloads/odysseus/docker-compose.override.yml
+#
+# This override configures networking so the Odysseus container can reach
+# Ollama running on the host via host.docker.internal:11434.
+#
+# Do NOT modify the original docker-compose.yml — this file overlays it.
+
+services:
+  odysseus:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
