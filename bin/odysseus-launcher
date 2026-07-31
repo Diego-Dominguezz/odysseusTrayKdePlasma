@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ODYSSEUS_DIR="${ODYSSEUS_DIR:-$HOME/Downloads/odysseus}"
+cd "$ODYSSEUS_DIR"
+
+echo '[Odysseus] Ensuring Ollama is running...'
+if ! systemctl is-active --quiet ollama; then
+  sudo systemctl start ollama
+fi
+
+for i in {1..60}; do
+  curl -fsS --max-time 2 http://127.0.0.1:11434/api/tags >/dev/null && break
+  sleep 1
+done
+curl -fsS --max-time 5 http://127.0.0.1:11434/api/tags >/dev/null || { echo '[Odysseus] Ollama unavailable'; exit 1; }
+
+echo '[Odysseus] Starting Docker stack...'
+docker compose up -d
+
+echo '[Odysseus] Waiting for web UI...'
+for i in {1..60}; do
+  curl -fsS --max-time 2 http://127.0.0.1:7000/login >/dev/null && { echo '[Odysseus] Ready: http://127.0.0.1:7000'; exit 0; }
+  sleep 1
+done
+
+echo '[Odysseus] Containers started, but UI did not become ready.'
+docker compose ps
+exit 1

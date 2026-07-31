@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Odysseus AI Tray
+Comment=Local Ollama and Odysseus controller
+Exec=/home/diegod/.local/bin/odysseus-tray
+Icon=odysseus
+Terminal=false
+StartupNotify=false
+X-KDE-autostart-after=panel
+Categories=Utility;Development;ArtificialIntelligence;
