@@ -1,6 +1,6 @@
 # Odysseus Local AI Stack
 
-One-command KDE/CachyOS integration for Ollama + Odysseus + Docker + a Plasma tray controller.
+One-command KDE/CachyOS integration for Ollama + Odysseus + Docker + a Plasma tray controller. This stack supports the Qwen3-Coder 30B agent for validating FastAPI application structure and multi-functional AI workspace architecture.
 
 ## Setup
 

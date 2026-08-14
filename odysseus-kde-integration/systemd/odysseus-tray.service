@@ -12,6 +12,7 @@ Environment=DISPLAY=:0
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=QT_QPA_PLATFORM=wayland
 Environment=QT_WAYLAND_DISABLE_WINDOWDECORATION=1
+Environment=ODYSSEUS_DIR=%h/Downloads/odysseus
 
 [Install]
 WantedBy=default.target
