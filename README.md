@@ -59,6 +59,51 @@ Recommended for your RX 7800 XT:
 - `qwen2.5-coder:14b` coding
 - `qwen3:8b` faster responses
 
+## OpEncode
+
+This repository ships the working opencode agent stack (agents, commands, skills, plugin deps and the exact ollama model tags they reference) under `opencode/`, so it can be replicated on any PC.
+
+### Prerequisites
+
+- Linux with `curl` (and `npm`/`node` as fallback for the installer and for the Playwright MCP server)
+- Ollama running locally on `127.0.0.1:11434` (this stack's installer starts it if possible)
+- Enough VRAM/RAM for the models: `gpt-oss:20b` (~13 GB) and `qwen3:14b` (~9 GB)
+
+### Install
+
+```bash
+./scripts/install-opencode.sh
+```
+
+The installer:
+
+- installs opencode via the official installer (npm fallback)
+- backs up any existing config at the target path with a timestamp before copying — never overwrites silently
+- copies `opencode/` from this repo to the opencode config directory
+- runs `npm install` in the config directory for the `@opencode-ai/plugin` dependency
+- ensures the ollama models exist: pulls `gpt-oss:20b` and `qwen3:14b`, and creates the `gpt-oss:20b-opencode` tag from `opencode/Modelfile.gpt-oss-20b-opencode` (tuned template, `num_ctx 40960`)
+- verifies the install and prints a summary
+
+Idempotent: safe to re-run; each run creates a fresh timestamped backup of the previous config.
+
+### Where configs get installed
+
+- Config dir: `~/.config/opencode/` (or `$XDG_CONFIG_HOME/opencode`)
+- Main config: `~/.config/opencode/opencode.json` — defines the agents `build` (primary), `fast-worker`, `research-gate`, `qwen3-auditor`, `security-review`, `qwen3-single-shot`, the ollama provider, compaction and the Playwright MCP server
+- Commands: `~/.config/opencode/commands/` — `research`, `security-review`
+- Skills: `~/.config/opencode/skills/` — `browser-debug`, `repo-inventory`, `security-audit`
+- Models: `gpt-oss:20b-opencode` and `qwen3:14b` served by the local ollama
+
+### Verify the agent loads correctly
+
+```bash
+opencode --version
+opencode agent list          # should list build, fast-worker, qwen3-auditor, research-gate, security-review, qwen3-single-shot
+ollama list                  # should show gpt-oss:20b-opencode and qwen3:14b
+```
+
+Then start the TUI and switch agents with `opencode` (default agent: `build`).
+
 ## Verify everything
 
 ```bash

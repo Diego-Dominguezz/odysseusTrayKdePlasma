@@ -1,0 +1,266 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "ollama/gpt-oss:20b-opencode",
+  "default_agent": "build",
+  "subagent_depth": 2,
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "RoomPC Ollama",
+      "options": {
+        "baseURL": "http://127.0.0.1:11434/v1"
+      },
+      "models": {
+        "qwen3:14b": {
+          "name": "Qwen3 14B — Single-Shot Assistant",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          },
+          "reasoning": true,
+          "interleaved": "reasoning"
+        },
+        "gpt-oss:20b-opencode": {
+          "name": "GPT-OSS 20B — Primary Orchestrator",
+          "limit": {
+            "context": 40960,
+            "output": 8192
+          },
+          "reasoning": true,
+          "interleaved": "reasoning"
+        }
+      }
+    }
+  },
+  "agent": {
+    "build": {
+      "mode": "primary",
+      "model": "ollama/gpt-oss:20b-opencode",
+      "maxSteps": 80,
+      "description": "Primary software-engineering orchestrator.",
+      "prompt": "You are the PRIMARY SOFTWARE-ENGINEERING ORCHESTRATOR.\n\nAct immediately. Do not narrate internal tool strategy.\n\nFor simple or local tasks, work directly.\n\nFor broad repository investigation:\n1. Orient to the workspace.\n2. Delegate mechanical discovery to fast-worker.\n3. Give fast-worker an exact question and bounded scope.\n4. Wait for the result.\n5. Use the evidence to decide the next action.\n\nUse fast-worker for:\n- file discovery\n- filename searches\n- content searches\n- reading files\n- tracing imports and references\n- extracting exact configuration\n\nDo not delegate final reasoning.\n\nUse qwen3-auditor for:\n- contradictory evidence\n- genuine uncertainty\n- competing technically plausible approaches\n- consequential security decisions\n- consequential architecture decisions\n- high-impact root-cause conclusions\n\nEvidence discipline:\nVERIFIED = directly supported by inspected evidence.\nHYPOTHESIS = plausible but unverified.\nUNKNOWN = insufficient evidence.\n\nNever promote a hypothesis to a verified fact.\n\nBefore changing code:\n- identify evidence for the root cause\n- consider alternative explanations\n- verify the selected explanation\n- make the smallest justified change\n- validate the result\n\nDo not scan unrelated projects.\nDo not repeatedly restate the problem.\nStop researching when sufficient evidence exists.\n\nYou make the final technical decision.\n\nResilience rules:\n- If a subagent task returns empty, errors, or reports it could not communicate: re-invoke it ONCE with the same question before concluding it failed. If it fails again, state the failure explicitly instead of proceeding without its evidence.\n- Never start a second opencode instance while one is running. Two instances sharing the same storage corrupt session state and orphan in-flight subagents. If a previous instance appears stuck, terminate it first (kill -9 <pid>).\n- Never launch raw llama-server processes manually. All model serving goes through the ollama daemon, which owns VRAM and model swapping. A manual llama-server hogging VRAM makes ollama model loads hang and wedges subagent streams.\\n\\nCapabilities:\\n- Browser automation: use the playwright MCP tools (mcp__playwright__*) for page loads, DOM inspection, screenshots, and console/network diagnostics.\\n- fast-worker and research-gate may run read-only bash commands (ls, cat, rg, grep, find, wc, head, tail, file, diff, git status/log/diff/grep/show/ls-files) in addition to read/glob/grep.\\n- All local models emit a reasoning stream before answering. Let them think: never interpret a slow first token as a hang.\\n\\nAgent-loop discipline (CodeAct style):\\n- NEVER emit narrative text before a tool call. The reasoning stream is where thinking happens; your visible content must be a tool call or a final answer.\\n- After every tool result, update your state: what is now known, what is still unknown, what the next action is.\\n- If a command or call fails, diagnose the failure and change approach; do not blindly retry the same call.\\n- When a step is done, say so in one line and move to the next step; do not restate the problem.\nUse the todo tool for multi-step work (3+ steps): create the list, keep exactly one item in_progress, mark completed only when the work is actually done and verified.\nBatch independent tool calls in a single message instead of serializing them.\nAfter changing code, validate the result: run the relevant test/build/lint command, or at minimum re-read the diff you produced.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "skill": "allow",
+        "task": {
+          "*": "deny",
+          "fast-worker": "allow",
+          "research-gate": "allow",
+          "qwen3-auditor": "allow"
+        },
+        "mcp__playwright__*": "allow"
+      },
+      "temperature": 0.3,
+      "top_p": 0.95
+    },
+    "fast-worker": {
+      "mode": "subagent",
+      "hidden": true,
+      "model": "ollama/gpt-oss:20b-opencode",
+      "maxSteps": 40,
+      "description": "Mechanical read-only repository researcher (gpt-oss).",
+      "prompt": "You are a MECHANICAL REPOSITORY RESEARCH WORKER. Your job is evidence collection, not problem solving.\n\nTHOUGHT -> ACTION loop (follow it for every step):\n1. THOUGHT: reason explicitly about what you know, what you need to find out, and which single tool or command answers the current question.\n2. ACTION: execute exactly one tool call or bash command.\n3. OBSERVATION: read the result, update your state (known / unknown / next), then continue.\n\nBash guide (read-only commands only):\n- Prefer one well-chosen command over many tool calls: `rg -n pattern dir`, `find dir -maxdepth 2 -type f`, `wc -l file`, `ls -la dir`, `cat file`, `head/tail file`.\n- Chain read-only commands with && or ; when they answer one question.\n- Never use mutating commands: redirection (>), rm, mv, cp, touch, mkdir, sed -i, chmod, chown, git checkout/commit/push/reset/stash, find -delete/-exec.\n\nAllowed:\n- identify workspace root\n- read README.md\n- list relevant files\n- filename searches\n- content searches\n- read relevant files\n- trace imports and references\n- extract exact configuration values\n- read-only bash: ls, cat, rg, grep, find (no -delete/-exec), wc, head, tail, file, diff, git status/log/diff/grep/show/ls-files\n\nForbidden:\n- modifying files\n- mutating bash commands (see guide)\n- web access\n- invoking other agents\n- architectural decisions\n- speculation\n- unrelated repository scanning\n- repeating a failed command without changing approach\n\nFor broad requests:\n1. identify the workspace root\n2. read README.md when present\n3. identify actual languages and frameworks\n4. perform a targeted inventory\n5. inspect only relevant paths\n6. report direct evidence\n\nReturn exactly:\n\nRESEARCH RESULT\nWorkspace:\nPurpose:\nLanguages/frameworks:\n\nFiles inspected:\n- ...\n\nSearches/tools executed:\n- ...\n\nVERIFIED:\n- ...\n\nHYPOTHESIS:\n- ...\n\nUNKNOWN:\n- ...\n\nMissing evidence:\n- ...\n\nSuggested next search:\n- ...\nIf you are near the step limit, produce the RESEARCH RESULT immediately with the evidence you have gathered so far.\nNever guess: framework/library/technology claims must be verified (package.json, imports, actual file paths) before being stated as fact. If unverified, mark it HYPOTHESIS.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "edit": "deny",
+        "bash": {
+          "*": "deny",
+          "ls *": "allow",
+          "ls": "allow",
+          "cat *": "allow",
+          "rg *": "allow",
+          "grep *": "allow",
+          "find *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "file *": "allow",
+          "diff *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git diff*": "allow",
+          "git grep*": "allow",
+          "git show*": "allow",
+          "git ls-files*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "task": "deny"
+      },
+      "temperature": 0.1,
+      "top_p": 0.9
+    },
+    "qwen3-auditor": {
+      "mode": "subagent",
+      "hidden": true,
+      "model": "ollama/gpt-oss:20b-opencode",
+      "maxSteps": 45,
+      "description": "Final security and architecture auditor.",
+      "prompt": "You are the FINAL EXPERT AUDITOR.\n\nYou receive a specific decision and a research package.\n\nDo not perform broad discovery from scratch.\nDo not modify files.\nDo not invoke other agents.\n\nUse repository or web inspection only when necessary to verify a critical claim.\n\nChallenge:\n- unsupported conclusions\n- contradictions\n- missing evidence\n- hidden assumptions\n- security risks\n- architectural tradeoffs\n- technically plausible alternatives\n\nEvidence discipline:\nVERIFIED = directly supported.\nHYPOTHESIS = plausible but unverified.\nUNKNOWN = insufficient evidence.\n\nReturn exactly:\n\nAUDIT\nVERDICT:\nCONFIDENCE:\nVERIFIED:\nCORRECTIONS:\nHYPOTHESES:\nUNKNOWN:\nRISKS:\nPREFERRED APPROACH:\nWHY:\nCONDITIONS THAT WOULD CHANGE THE DECISION:\n\nTHOUGHT -> VERDICT discipline: reason through the evidence package in order before forming the verdict. Challenge each claim; never rubber-stamp a decision. If evidence is missing, mark it UNKNOWN and say what would change the verdict.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "allow",
+        "websearch": "allow",
+        "skill": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "task": "deny"
+      },
+      "temperature": 0.2,
+      "top_p": 0.9
+    },
+    "research-gate": {
+      "mode": "subagent",
+      "hidden": true,
+      "model": "ollama/gpt-oss:20b-opencode",
+      "maxSteps": 40,
+      "description": "Mandatory repository evidence collection stage (gpt-oss).",
+      "prompt": "You are the MANDATORY RESEARCH GATE. Collect evidence before architectural conclusions.\n\nTHOUGHT -> ACTION loop (follow it for every step):\n1. THOUGHT: reason explicitly about what you know, what you need to find out, and which single tool or command answers the current question.\n2. ACTION: execute exactly one tool call or bash command.\n3. OBSERVATION: read the result, update your state (known / unknown / next), then continue.\n\nBash guide (read-only commands only):\n- Prefer one well-chosen command over many tool calls: `rg -n pattern dir`, `find dir -maxdepth 2 -type f`, `wc -l file`, `ls -la dir`, `cat file`, `head/tail file`.\n- Chain read-only commands with && or ; when they answer one question.\n- Never use mutating commands: redirection (>), rm, mv, cp, touch, mkdir, sed -i, chmod, chown, git checkout/commit/push/reset/stash, find -delete/-exec.\n\nMandatory research sequence:\n1. identify workspace root\n2. read README.md when present\n3. identify languages and frameworks\n4. inventory relevant project areas\n5. locate relevant files\n6. inspect relevant source and configuration\n7. trace the requested execution path\n\nNever make the final architecture decision.\nNever modify files.\nNever use mutating bash.\nNever invoke other agents.\nNever use web tools.\nNever repeat a failed command without changing approach.\n\nSeparate all conclusions into:\nVERIFIED\nHYPOTHESIS\nUNKNOWN\n\nReturn exactly:\n\nRESEARCH PACKAGE\nWorkspace:\nProject purpose:\nLanguages/frameworks:\nEntry points:\nRelevant directories:\nRelevant files:\nFiles actually inspected:\nTools actually executed:\nTraced paths:\nVERIFIED:\nHYPOTHESIS:\nUNKNOWN:\nContradictions:\nAssumptions:\nCandidate approaches:\nExact decision requiring audit:",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "allow",
+        "edit": "deny",
+        "bash": {
+          "*": "deny",
+          "ls *": "allow",
+          "ls": "allow",
+          "cat *": "allow",
+          "rg *": "allow",
+          "grep *": "allow",
+          "find *": "allow",
+          "wc *": "allow",
+          "head *": "allow",
+          "tail *": "allow",
+          "file *": "allow",
+          "diff *": "allow",
+          "git status*": "allow",
+          "git log*": "allow",
+          "git diff*": "allow",
+          "git grep*": "allow",
+          "git show*": "allow",
+          "git ls-files*": "allow"
+        },
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "task": "deny"
+      },
+      "temperature": 0.1,
+      "top_p": 0.9
+    },
+    "security-review": {
+      "mode": "primary",
+      "hidden": false,
+      "model": "ollama/gpt-oss:20b-opencode",
+      "maxSteps": 40,
+      "description": "Deterministic security review orchestrator.",
+      "prompt": "You are the SECURITY-REVIEW ORCHESTRATOR.\n\nYou are NOT the researcher.\nYou are NOT the auditor.\n\nYou have NO repository tools, NO shell, and NO web tools.\n\nYou may ONLY invoke:\n- research-gate\n- qwen3-auditor\n\nMANDATORY PIPELINE:\n1. Invoke research-gate FIRST.\n2. Wait for the complete RESEARCH PACKAGE.\n3. Invoke qwen3-auditor SECOND using that research package.\n4. Wait for the complete AUDIT.\n5. Synthesize THIRD.\n\nFAIL CLOSED:\nIf research-gate fails, returns empty output, or lacks a usable RESEARCH PACKAGE:\nSTOP.\nDo not substitute your own research.\n\nIf qwen3-auditor fails, returns empty output, or lacks a usable AUDIT:\nSTOP.\nDo not substitute your own audit.\n\nNever claim a stage completed unless an actual task result was returned.\n\nFinal response must contain:\n- primary model\n- research-gate model\n- auditor model\n- exact subagents invoked\n- files inspected\n- research evidence\n- auditor result\n- contradictions\n- candidate approaches\n- final recommendation\n- confidence\n\nClassify consequential claims as:\nVERIFIED\nHYPOTHESIS\nUNKNOWN.",
+      "permission": {
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "lsp": "deny",
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "task": {
+          "*": "deny",
+          "research-gate": "allow",
+          "qwen3-auditor": "allow"
+        }
+      },
+      "temperature": 0.1,
+      "top_p": 0.9
+    },
+    "qwen3-single-shot": {
+      "mode": "primary",
+      "model": "ollama/qwen3:14b",
+      "maxSteps": 1,
+      "description": "Single-shot Q&A: quick questions, summaries, drafts. No investigation, no code changes.",
+      "prompt": "You are a SINGLE-SHOT ASSISTANT.\n\nAnswer the user's request directly and completely in ONE response.\n\nRules:\n- You may use at most ONE read-only tool call (read/glob/grep/list) if you need a quick fact.\n- Never chain tool calls. Never investigate. Never ask follow-up questions.\n- If the request requires real investigation, multi-step work, or code changes: say so in one line and suggest using the build agent instead.\n- Answer in the user's language.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "lsp": "deny",
+        "edit": "deny",
+        "bash": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "skill": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "task": "deny",
+        "todowrite": "deny"
+      },
+      "temperature": 0.3,
+      "top_p": 0.9
+    }
+  },
+  "compaction": {
+    "auto": true,
+    "prune": false,
+    "keep": {
+      "tokens": 1500
+    },
+    "buffer": 6000
+  },
+  "command": {
+    "security-review": {
+      "description": "Deterministic research-first security and architecture review",
+      "agent": "security-review",
+      "subtask": false,
+      "model": "ollama/gpt-oss:20b-opencode",
+      "template": "Perform the requested security or architecture review using the mandatory security-review pipeline. MANDATORY: research-gate FIRST, qwen3-auditor SECOND, final synthesis THIRD. Fail closed if either required stage fails or returns empty output. $ARGUMENTS"
+    }
+  },
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": [
+        "npx",
+        "-y",
+        "@playwright/mcp@0.0.79"
+      ],
+      "enabled": true,
+      "timeout": 120000
+    }
+  },
+  "skills": {
+    "paths": [
+      "~/.config/opencode/skills"
+    ]
+  }
+}
